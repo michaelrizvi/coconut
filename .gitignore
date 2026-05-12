@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+
+# Experiment outputs
+wandb/
+logs/
+*.out
+*.err
+
+# Data (large files)
+# data/  # uncomment if you don't want to track datasets
+
+# Checkpoints
+*.pt
+*.ckpt
+checkpoints/
+
+# Misc
+.DS_Store
+*.swp

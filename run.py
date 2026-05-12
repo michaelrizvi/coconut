@@ -36,6 +36,53 @@ import functools
 from utils import Config, set_seed
 
 
+def get_decoder_layer_cls(model):
+    """Return the transformer decoder layer class for the given model, or None if unknown."""
+    model_type = model.config.model_type
+    if model_type in ("llama", "mistral"):
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        return LlamaDecoderLayer
+    elif model_type == "gpt_neox":
+        from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+        return GPTNeoXLayer
+    elif model_type == "gemma":
+        from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
+        return GemmaDecoderLayer
+    elif model_type == "gemma2":
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
+        return Gemma2DecoderLayer
+    else:
+        return None
+
+
+def compute_grad_norms(model):
+    """Compute per-group gradient norms for the base GPT-2 model.
+
+    Groups: wte (token embeddings, tied with lm_head), wpe (position embeddings),
+    attn, mlp, ln (layer norms).
+
+    Note: GPT-2 ties wte.weight and lm_head.weight, so wte grads include
+    the output projection gradient contribution.
+    """
+    group_norms = {"wte": 0.0, "wpe": 0.0, "attn": 0.0, "mlp": 0.0, "ln": 0.0}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        grad_norm_sq = param.grad.detach().float().norm() ** 2
+        if "wte" in name or "lm_head" in name:
+            group_norms["wte"] += grad_norm_sq.item()
+        elif "wpe" in name:
+            group_norms["wpe"] += grad_norm_sq.item()
+        elif "attn" in name:
+            group_norms["attn"] += grad_norm_sq.item()
+        elif "mlp" in name:
+            group_norms["mlp"] += grad_norm_sq.item()
+        elif "ln" in name or "layernorm" in name:
+            group_norms["ln"] += grad_norm_sq.item()
+    # Return L2 norms (sqrt of sum of squared norms)
+    return {k: v ** 0.5 for k, v in group_norms.items()}
+
+
 def main():
 
     parser = argparse.ArgumentParser(description="coconut")
@@ -57,6 +104,9 @@ def main():
         print("Config:", config_dict)
 
     configs = Config(config_dict)
+    # Default optional flags
+    if not hasattr(configs, "log_grad_norms"):
+        configs.log_grad_norms = False
     set_seed(configs.seed)
     save_dir = os.path.join(configs.save_path, configs.name)
 
@@ -153,7 +203,8 @@ def main():
             target_embedding = embeddings.weight.data[target_id] 
             embeddings.weight.data[token_id] = target_embedding
             # The input embeddings and lm heads are tied in GPT2. So the code below is not necessary
-            lm_head = model.lm_head
+            # Use get_output_embeddings() for model-agnostic access (e.g., Pythia uses embed_out not lm_head)
+            lm_head = model.get_output_embeddings()
             lm_head.weight.data[token_id] = lm_head.weight.data[target_id]
 
     if configs.no_thoughts:
@@ -169,12 +220,11 @@ def main():
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(rank)
 
+    decoder_layer_cls = get_decoder_layer_cls(model if not configs.coconut else model.base_causallm)
+    layer_cls_set = {decoder_layer_cls} if decoder_layer_cls is not None else set()
     llama_auto_wrap_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            # GPT2Block,       # for GPT2, we don't need to shard layers (it becomes DDP)
-            LlamaDecoderLayer  # only shard llama's layers.
-        },
+        transformer_layer_cls=layer_cls_set,
     )
 
     if configs.bf16:
@@ -186,7 +236,8 @@ def main():
 
     else:
         parallel_model = FSDP(
-            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank
+            model, auto_wrap_policy=llama_auto_wrap_policy, device_id=rank,
+            use_orig_params=True,
         )
 
     del model
@@ -202,7 +253,7 @@ def main():
     cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
 
     base_dataset_valid = get_dataset(
-        configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000
+        configs.val_path, tokenizer, max_size=getattr(configs, "debug_val_size", 32) if configs.debug else 100000000
     )
 
     if not configs.only_eval:
@@ -236,6 +287,7 @@ def main():
         )
 
     best_acc = 0
+    grad_norm_records = []  # raw grad norm data for JSON export
 
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
 
@@ -321,6 +373,8 @@ def main():
             parallel_model.module.train()
 
             total_length = len(train_dataloader) // configs.gradient_accumulation_steps
+            # ~20 log points per epoch for grad norms
+            grad_norm_log_every = max(1, total_length // 20) if configs.log_grad_norms else 0
             pbar = tqdm(
                 colour="blue",
                 desc=f"Training Epoch: {epoch+1}",
@@ -366,6 +420,26 @@ def main():
                 if (step + 1) % configs.gradient_accumulation_steps == 0 or step == len(
                     train_dataloader
                 ) - 1:
+                    # Log gradient norms before optimizer step (when full gradient is accumulated)
+                    # summon_full_params is a collective — all ranks must call it together
+                    if configs.log_grad_norms:
+                        opt_step = (step + 1) // configs.gradient_accumulation_steps
+                        if grad_norm_log_every > 0 and opt_step % grad_norm_log_every == 0:
+                            with FSDP.summon_full_params(parallel_model, writeback=False, with_grads=True):
+                                if rank == 0:
+                                    gnorms = compute_grad_norms(parallel_model)
+                            if rank == 0:
+                                record = {
+                                    "epoch": epoch + 1,
+                                    "stage": scheduled_stage,
+                                    "opt_step": opt_step,
+                                    "global_opt_step": total_train_steps // configs.gradient_accumulation_steps,
+                                }
+                                record.update(gnorms)
+                                grad_norm_records.append(record)
+                                if wandb_run:
+                                    wandb_run.log({f"grad_norm/{k}": v for k, v in gnorms.items()})
+
                     optimizer.step()
                     optimizer.zero_grad()
                     pbar.update(1)
@@ -385,6 +459,12 @@ def main():
                 )
             pbar.close()
             dist.barrier()
+
+            # Incrementally save grad norm records after each epoch
+            if configs.log_grad_norms and rank == 0 and grad_norm_records:
+                grad_norm_path = os.path.join(save_dir, "grad_norms.json")
+                with open(grad_norm_path, "w") as f:
+                    json.dump(grad_norm_records, f, indent=2)
 
             if (
                 not configs.save_only_improve
@@ -459,11 +539,14 @@ def main():
                 total += 1
 
                 # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
-                outputs = parallel_model.module.generate(
-                    **batch,
-                    max_new_tokens=max_new_tokens,
-                    synced_gpus=not configs.only_eval,
-                )
+                # summon_full_params needed with use_orig_params=True so that
+                # generate() (which bypasses FSDP forward) sees proper parameter shapes
+                with FSDP.summon_full_params(parallel_model, writeback=False):
+                    outputs = parallel_model.module.generate(
+                        **batch,
+                        max_new_tokens=max_new_tokens,
+                        synced_gpus=not configs.only_eval,
+                    )
 
                 text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 answer_output = text_output.split("#")[-1].replace(",", "").strip()
@@ -527,6 +610,14 @@ def main():
             del states
             gc.collect()
             torch.cuda.empty_cache()
+
+
+    # Final grad norm save (in case loop exited early)
+    if configs.log_grad_norms and rank == 0 and grad_norm_records:
+        grad_norm_path = os.path.join(save_dir, "grad_norms.json")
+        with open(grad_norm_path, "w") as f:
+            json.dump(grad_norm_records, f, indent=2)
+        print(f"Saved {len(grad_norm_records)} grad norm records to {grad_norm_path}")
 
 
 if __name__ == "__main__":

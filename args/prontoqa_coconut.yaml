@@ -1,7 +1,7 @@
 # need 4 gpus
 
 project: coconut
-save_path: YOUR_PATH_TO_SAVE_THE_MODEL
+save_path: /network/scratch/m/michael.rizvi-martel/coconut_checkpoints
 name: prontoqa-coconut
 
 only_eval: False
